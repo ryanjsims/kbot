@@ -1,0 +1,4 @@
+.venv
+.env
+rss.cache
+.last-updated
