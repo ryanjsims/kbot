@@ -18,14 +18,8 @@ import logging
 import http.client as http_client
 import string
 import random
-http_client.HTTPConnection.debuglevel = 1
 
 logging.basicConfig()
-logging.getLogger().setLevel(logging.DEBUG)
-requests_log = logging.getLogger("requests.packages.urllib3")
-requests_log.setLevel(logging.DEBUG)
-requests_log.propagate = True
-
 logger = logging.getLogger("kbot")
 logger.setLevel(logging.DEBUG)
 
@@ -57,7 +51,7 @@ def login_hook(r: requests.Response, *args, **kwargs):
 
 def rate_limit_hook(r: requests.Response, *args, **kwargs):
     global last_request_time
-    poll_latency = 0.5
+    poll_latency = 1.0
 
     now = time()
     if now < poll_latency + last_request_time:
@@ -146,30 +140,42 @@ def post_link(link: str, title: str, description: Optional[str] = None, tags: Op
         "entry_link[_token]": _csrf_token
     }
 
-    file_data = {
-        "entry_link[url]": (None, link),
-        "entry_link[title]": (None, title),
-        "entry_link[body]": (None, description if description is not None else ""),
-        "entry_link[magazine][autocomplete]": (None, str(magazine_id)),
-        "entry_link[tags]": (None, ",".join(tags) if tags else ""),
-        "entry_link[badges]": (None, ""),
-        "entry_link[image]": ("", "", "application/octet-stream"),
-        "entry_link[imageUrl]": (None, ""),
-        "entry_link[imageAlt]": (None, ""),
-        "entry_link[lang]": (None, KBOT_LANG),
-        "entry_link[submit]": (None, ""),
-        "entry_link[_token]": (None, _csrf_token)
-    }
-
-    m = MultipartEncoder(fields=form_data)
-
-    dictionary = string.ascii_letters + string.digits
+    #dictionary = string.ascii_letters + string.digits
+    m = MultipartEncoder(
+        fields=form_data
+        #, boundary=f"----WebKitFormBoundary{''.join([random.choice(dictionary) for _ in range(16)])}"
+    )
 
     headers = {
-        "Content-Type": m.content_type
+        # "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        # "Accept-Encoding": "gzip, deflate, br",
+        # "Accept-Language": "en-US,en;q=0.9",
+        # "Cache-Control": "max-age=0",
+        "Content-Type": m.content_type,
+        "Origin": f"https://{KBOT_INSTANCE}",
+        "Referer": f"https://{KBOT_INSTANCE}/m/{KBOT_MAGAZINE}/new",
+        # "Sec-Ch-Ua": '"Not.A/Brand";v="8", "Chromium";v="114", "Google Chrome";v="114"',
+        # "Sec-Ch-Ua-Mobile": "?0",
+        # "Sec-Ch-Ua-Platform": "Windows",
+        # "Sec-Fetch-Dest": "document",
+        # "Sec-Fetch-Mode": "navigate",
+        # "Sec-Fetch-Site": "same-origin",
+        # "Sec-Fetch-User": "?1",
+        # "Upgrade-Insecure-Requests": "1",
+        # "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
     }
 
-    response = kbin_session.post(f"https://{KBOT_INSTANCE}/m/{KBOT_MAGAZINE}/new", data=m, headers=headers)
+    data = m.to_string().strip(b"\r\n")
+    #sleep(1)
+    retries = 3
+    status = 422
+    while status == 422 and retries > 0:
+        response = kbin_session.post(f"https://{KBOT_INSTANCE}/m/{KBOT_MAGAZINE}/new", data=data, headers=headers)
+        status = response.status_code
+        if status == 422:
+            retries -= 1
+            logger.debug(f"Auto retrying after delay due to 422 error... ({retries} left)")
+            sleep(2)
     #response = kbin_session.post(f"https://httpbin.org/post", files=file_data, data=form_data)
     #print(response.text)
     #sys.exit(1)
@@ -202,11 +208,10 @@ def main():
 
             logger.debug(rss_data.channel.title)
 
-            for item in rss_data.channel.items:
+            for item in reversed(rss_data.channel.items):
                 logger.debug(item.title)
                 pub_date = parse(str(item.pub_date))
-                logger.debug(repr(pub_date))
-                logger.debug(f"Needs update? {last_updated < pub_date}")
+                logger.debug(pub_date)
                 logger.debug(item.link)
 
                 author = str(item.author)
@@ -219,7 +224,7 @@ def main():
                 if(last_updated < pub_date):
                     link = str(item.link)
                     title = f"{rss_data.channel.title} - {item.title}"
-                    description = f"Author: {author}\r\n\r\nDescription: {rss_data.channel.description}"
+                    description = f"Author: {author}\n\nDescription: {rss_data.channel.description}"
                     try:
                         logger.debug(f"Posting '{title}'...")
                         result = post_link(link, title, description)
