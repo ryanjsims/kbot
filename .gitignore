@@ -2,3 +2,4 @@
 .env
 rss.cache
 .last-updated
+.vscode
