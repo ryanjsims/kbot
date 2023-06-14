@@ -5,19 +5,13 @@ import re
 import json
 import shutil
 from time import sleep, time
-from datetime import datetime
+from datetime import datetime, timedelta
 from dateutil.parser import *
 from dateutil.tz import tzutc
-from argparse import ArgumentParser
 from dotenv import load_dotenv
 from rss_parser import Parser as RSSParser
-from typing import Optional, List
-import sys
-from io import BytesIO
+from typing import Optional, List, Dict, Union
 import logging
-import http.client as http_client
-import string
-import random
 
 logging.basicConfig()
 logger = logging.getLogger("kbot")
@@ -25,8 +19,10 @@ logger.setLevel(logging.DEBUG)
 
 load_dotenv()
 
-TOKEN_REGEX = re.compile('"(_csrf_token|entry_link\[_token\])"\s+value="(.+)"')
+TOKEN_REGEX = re.compile('"(_csrf_token|entry_link\[_token\]|entry_comment\[_token\])"\s+value="(.+)"')
 MAGAZINE_REGEX = re.compile('"entry_link\[magazine\]\[autocomplete\]".+value="([0-9]+)"\sselected="selected"')
+# Group 1 is thread id, 2 is title
+THREAD_REGEX = re.compile('id="entry-([0-9]+)"[\sa-zA-Z\-=":@>#<0-9]+<a\s+href=".+">(.+)<\/a>')
 
 KBOT_USER = os.getenv("KBOT_USER")
 KBOT_PASS = os.getenv("KBOT_PASS")
@@ -36,6 +32,7 @@ KBOT_RSS = os.getenv("KBOT_RSS")
 KBOT_LANG = os.getenv("KBOT_LANG")
 
 KBOT_FREQUENCY = max(120, int(os.getenv("KBOT_FREQUENCY", "600")))
+KBOT_THREAD_CACHE_SECONDS = max(10, int(os.getenv("KBOT_THREAD_CACHE_SECONDS", "30")))
 
 assert KBOT_USER and KBOT_PASS and KBOT_INSTANCE and KBOT_MAGAZINE and KBOT_RSS and KBOT_LANG, "Environment not set up correctly!"
 
@@ -57,6 +54,7 @@ def rate_limit_hook(r: requests.Response, *args, **kwargs):
     if now < poll_latency + last_request_time:
         sleep(min(poll_latency, poll_latency + last_request_time > now))
     last_request_time = time()
+
 
 def get_session():
     global last_request_time
@@ -140,29 +138,14 @@ def post_link(link: str, title: str, description: Optional[str] = None, tags: Op
         "entry_link[_token]": _csrf_token
     }
 
-    #dictionary = string.ascii_letters + string.digits
     m = MultipartEncoder(
         fields=form_data
-        #, boundary=f"----WebKitFormBoundary{''.join([random.choice(dictionary) for _ in range(16)])}"
     )
 
     headers = {
-        # "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        # "Accept-Encoding": "gzip, deflate, br",
-        # "Accept-Language": "en-US,en;q=0.9",
-        # "Cache-Control": "max-age=0",
         "Content-Type": m.content_type,
         "Origin": f"https://{KBOT_INSTANCE}",
-        "Referer": f"https://{KBOT_INSTANCE}/m/{KBOT_MAGAZINE}/new",
-        # "Sec-Ch-Ua": '"Not.A/Brand";v="8", "Chromium";v="114", "Google Chrome";v="114"',
-        # "Sec-Ch-Ua-Mobile": "?0",
-        # "Sec-Ch-Ua-Platform": "Windows",
-        # "Sec-Fetch-Dest": "document",
-        # "Sec-Fetch-Mode": "navigate",
-        # "Sec-Fetch-Site": "same-origin",
-        # "Sec-Fetch-User": "?1",
-        # "Upgrade-Insecure-Requests": "1",
-        # "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+        "Referer": f"https://{KBOT_INSTANCE}/m/{KBOT_MAGAZINE}/new"
     }
 
     data = m.to_string().strip(b"\r\n")
@@ -176,15 +159,50 @@ def post_link(link: str, title: str, description: Optional[str] = None, tags: Op
             retries -= 1
             logger.debug(f"Auto retrying after delay due to 422 error... ({retries} left)")
             sleep(2)
-    #response = kbin_session.post(f"https://httpbin.org/post", files=file_data, data=form_data)
-    #print(response.text)
-    #sys.exit(1)
+    
     if(response.status_code not in [200, 302]):
         logger.error(f"Unexpected status code: {response.status_code} - {response.url}")
         return False
 
     return True
 
+###
+# Dictionary of magazine names to dictionaries containing two keys:
+#    - "cached_at" -> datetime
+#    - "threads" -> Dict[int, str]
+#
+cached_threads: Dict[str, Dict[str, Union[datetime, Dict[int, str]]]] = {}
+THREAD_CACHE_TIMEOUT = timedelta(seconds=KBOT_THREAD_CACHE_SECONDS)
+
+# Lists threads in magazine by id -> title
+# Caches threads automatically for 10 to infinite seconds, configurable with .env KBOT_THREAD_CACHE_SECONDS
+def list_threads(magazine: str) -> Dict[int, str]:
+    global cached_threads
+    if magazine in cached_threads and (datetime.utcnow() - cached_threads[magazine]["cached_at"]) < THREAD_CACHE_TIMEOUT:
+        return cached_threads[magazine]["threads"]
+    to_return = {}
+    response = kbin_session.get(f"https://{KBOT_INSTANCE}/m/{magazine}")
+    if response.status_code != 200:
+        logger.error(f"Got unexpected status while retrieving threads: {response.status_code}")
+        return to_return
+    matches: List[re.Match[str]] = THREAD_REGEX.findall(response.text)
+    for match in matches:
+        thread_id = int(match.group(1))
+        title = match.group(2)
+        to_return[thread_id] = title
+
+    cached_threads[magazine] = {
+        "cached_at": datetime.utcnow(),
+        "threads": to_return
+    }
+    return to_return
+
+def post_toplevel_comment(magazine: str, thread_id: int, body: str, lang: str) -> bool:
+    response = kbin_session.get(f"https://{KBOT_INSTANCE}/m/{magazine}/t/{thread_id}")
+    if response.status_code != 200:
+        logger.error(f"Unexpected status code while retrieving thread: {response.status_code}")
+        return False
+    csrf_token = get_csrf(response)
 
 def main():
     global logged_in
