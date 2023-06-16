@@ -148,12 +148,10 @@ def post_link(link: str, title: str, description: Optional[str] = None, tags: Op
         "Referer": f"https://{KBOT_INSTANCE}/m/{KBOT_MAGAZINE}/new"
     }
 
-    data = m.to_string().strip(b"\r\n")
-    #sleep(1)
     retries = 3
     status = 422
     while status == 422 and retries > 0:
-        response = kbin_session.post(f"https://{KBOT_INSTANCE}/m/{KBOT_MAGAZINE}/new", data=data, headers=headers)
+        response = kbin_session.post(f"https://{KBOT_INSTANCE}/m/{KBOT_MAGAZINE}/new", data=m, headers=headers)
         status = response.status_code
         if status == 422:
             retries -= 1
@@ -176,9 +174,9 @@ THREAD_CACHE_TIMEOUT = timedelta(seconds=KBOT_THREAD_CACHE_SECONDS)
 
 # Lists threads in magazine by id -> title
 # Caches threads automatically for 10 to infinite seconds, configurable with .env KBOT_THREAD_CACHE_SECONDS
-def list_threads(magazine: str) -> Dict[int, str]:
+def list_threads(magazine: str, invalidate_cache: bool = False) -> Dict[int, str]:
     global cached_threads
-    if magazine in cached_threads and (datetime.utcnow() - cached_threads[magazine]["cached_at"]) < THREAD_CACHE_TIMEOUT:
+    if not invalidate_cache and magazine in cached_threads and (datetime.utcnow() - cached_threads[magazine]["cached_at"]) < THREAD_CACHE_TIMEOUT:
         return cached_threads[magazine]["threads"]
     to_return = {}
     response = kbin_session.get(f"https://{KBOT_INSTANCE}/m/{magazine}")
@@ -202,7 +200,46 @@ def post_toplevel_comment(magazine: str, thread_id: int, body: str, lang: str) -
     if response.status_code != 200:
         logger.error(f"Unexpected status code while retrieving thread: {response.status_code}")
         return False
+    
     csrf_token = get_csrf(response)
+    if csrf_token is None:
+        logger.error("Could not find csrf_token while posting comment!")
+        return False
+    
+    form_data = {
+        "entry_comment[body]": body,
+        "entry_comment[image]": ("", "", "application/octet-stream"),
+        "entry_comment[imageUrl]": "",
+        "entry_comment[imageAlt]": "",
+        "entry_comment[lang]": KBOT_LANG,
+        "entry_comment[submit]": "",
+        "entry_comment[_token]": csrf_token
+    }
+
+    m = MultipartEncoder(fields=form_data)
+
+    headers = {
+        "Content-Type": m.content_type,
+        "Origin": f"https://{KBOT_INSTANCE}",
+        "Referer": f"https://{KBOT_INSTANCE}/m/{magazine}/t/{thread_id}"
+    }
+
+    retries = 3
+    status = 422
+    while status == 422 and retries > 0:
+        response = kbin_session.post(f"https://{KBOT_INSTANCE}/m/{magazine}/t/{thread_id}/-/comment", data=m, headers=headers)
+        status = response.status_code
+        if status == 422:
+            retries -= 1
+            logger.debug(f"Auto retrying after delay due to 422 error... ({retries} left)")
+            sleep(2)
+    
+    if(response.status_code not in [200, 302]):
+        logger.error(f"Unexpected status code while adding comment: {response.status_code} - {response.url}")
+        return False
+
+    return True
+
 
 def main():
     global logged_in
@@ -225,6 +262,7 @@ def main():
                 login()
 
             logger.debug(rss_data.channel.title)
+            threads = list_threads(KBOT_MAGAZINE)
 
             for item in reversed(rss_data.channel.items):
                 logger.debug(item.title)
@@ -259,6 +297,23 @@ def main():
                     except Exception as e:
                         logger.error(f"Got exception while posting link: {e}")
         
+            new_threads = list_threads(KBOT_MAGAZINE, True)
+
+            comment = "\n".join([part.strip() for part in ("""
+            @rideranton@kbin.social
+            @rideranton@fedia.io
+
+            Proximal Flame has posted a new chapter in The Last Angel!
+
+            ---
+            This action was performed automatically.
+            """.strip("\n").split("\n"))]).strip("\n")
+
+            for thread_id in new_threads:
+                if thread_id in threads:
+                    continue
+                post_toplevel_comment(KBOT_MAGAZINE, thread_id, comment)
+
             if result:
                 if os.path.exists(cache_name):
                     shutil.copyfile(cache_name, f"{cache_name}.bak")
