@@ -18,3 +18,7 @@ WorkingDirectory=/home/pi/repos/kbot
 [Install]
 WantedBy=multi-user.target
 ```
+
+Create this file as `/etc/systemd/system/kbot.service`, updating as needed
+
+Then run `sudo systemctl start kbot` to start it, and `sudo systemctl enable kbot` to have it auto start on boot
