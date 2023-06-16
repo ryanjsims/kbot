@@ -13,11 +13,16 @@ from rss_parser import Parser as RSSParser
 from typing import Optional, List, Dict, Union
 import logging
 
-logging.basicConfig()
-logger = logging.getLogger("kbot")
-logger.setLevel(logging.DEBUG)
-
 load_dotenv()
+
+KBOT_STDOUT = os.getenv("KBOT_STDOUT", "/dev/fd/0")
+KBOT_STDERR = os.getenv("KBOT_STDERR", "/dev/fd/1")
+KBOT_LOGLEVEL = os.getenv("KBOT_LOGLEVEL", "INFO")
+
+logging.basicConfig(filename=KBOT_STDERR)
+logger = logging.getLogger("kbot")
+logger.setLevel(logging._nameToLevel[KBOT_LOGLEVEL])
+
 
 TOKEN_REGEX = re.compile('"(_csrf_token|entry_link\[_token\]|entry_comment\[_token\])"\s+value="(.+)"')
 MAGAZINE_REGEX = re.compile('"entry_link\[magazine\]\[autocomplete\]".+value="([0-9]+)"\sselected="selected"')
